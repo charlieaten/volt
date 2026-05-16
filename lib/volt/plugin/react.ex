@@ -43,6 +43,22 @@ defmodule Volt.Plugin.React do
     version
   )
 
+  @react_dom_exports ~w(
+    __DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE
+    createPortal
+    flushSync
+    preconnect
+    prefetchDNS
+    preinit
+    preinitModule
+    preload
+    preloadModule
+    requestFormReset
+    unstable_batchedUpdates
+    useFormState
+    useFormStatus
+  )
+
   @impl true
   def name, do: "react"
 
@@ -63,9 +79,31 @@ defmodule Volt.Plugin.React do
          named_from: "react-dom/client",
          names: ["createRoot", "hydrateRoot", {"version", "reactDomVersion"}]
        },
-       %{named_from: "react/jsx-runtime", names: ["jsx", "jsxs"]}
+       %{named_from: "react-dom", names: @react_dom_exports},
+       %{named_from: "react/jsx-runtime", names: ["jsx", "jsxs"]},
+       %{named_from: "react/jsx-dev-runtime", names: ["jsxDEV"]}
      ]}
   end
 
+  def prebundle_entry("react-dom") do
+    {:source, "react-dom.js", react_dom_entry_source()}
+  end
+
   def prebundle_entry(_specifier), do: nil
+
+  defp react_dom_entry_source do
+    members = Enum.join(@react_dom_exports, ", ")
+
+    """
+    import { #{members}, reactDomVersion } from "react";
+
+    const ReactDOM = {
+      #{members},
+      version: reactDomVersion,
+    };
+
+    export default ReactDOM;
+    export { #{members}, reactDomVersion as version };
+    """
+  end
 end

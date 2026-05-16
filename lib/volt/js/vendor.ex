@@ -15,6 +15,8 @@ defmodule Volt.JS.Vendor do
 
   require Logger
 
+  @react_singleton_imports ~w(react react-dom react-dom/client react/jsx-runtime react/jsx-dev-runtime)
+
   defp cache_dir do
     build_path = System.get_env("MIX_BUILD_PATH") || "_build"
     Path.join(build_path, "volt/vendor")
@@ -165,11 +167,18 @@ defmodule Volt.JS.Vendor do
             define: %{"process.env.NODE_ENV" => ~s("development")},
             exports: :named,
             preserve_entry_signatures: :strict
-          ] ++ if(module_types != %{}, do: [module_types: module_types], else: [])
+          ] ++
+            singleton_external_opts(specifier) ++
+            if(module_types != %{}, do: [module_types: module_types], else: [])
 
         case OXC.bundle(entry_path, bundle_opts) do
           {:ok, result} ->
-            File.write!(output_path, extract_code(result))
+            code =
+              result
+              |> extract_code()
+              |> rewrite_vendor_imports(specifier, plugins)
+
+            File.write!(output_path, code)
             {:ok, output_path}
 
           {:error, _} = error ->
@@ -199,12 +208,12 @@ defmodule Volt.JS.Vendor do
     end
   end
 
-  defp synthetic_prebundle_entry(specifier, filename, source, module_dirs) do
+  defp synthetic_prebundle_entry(specifier, filename, source, _module_dirs) do
     dir = Path.join([cache_dir(), "entries", encode_specifier(specifier)])
-    path = Path.join(dir, filename)
+    path = Path.expand(Path.join(dir, filename))
     File.mkdir_p!(dir)
     File.write!(path, source)
-    {:ok, path, project_root(module_dirs)}
+    {:ok, path, File.cwd!()}
   end
 
   defp package_prebundle_entry(specifier, module_dirs) do
@@ -228,6 +237,74 @@ defmodule Volt.JS.Vendor do
 
   defp extract_code(result) when is_binary(result), do: result
   defp extract_code(%{code: code}), do: code
+
+  defp singleton_external_opts("react"), do: []
+
+  defp singleton_external_opts(_specifier) do
+    [external: @react_singleton_imports]
+  end
+
+  defp rewrite_vendor_imports(code, specifier, plugins) do
+    code
+    |> Volt.JS.ImportRewriter.rewrite!(
+      "#{encode_specifier(specifier)}.js",
+      fn import_specifier ->
+        if NPM.Resolution.PackageResolver.bare?(import_specifier) do
+          canonical = Volt.PluginRunner.prebundle_alias(plugins, import_specifier)
+          {:rewrite, vendor_url(canonical)}
+        else
+          :keep
+        end
+      end
+    )
+    |> rewrite_singleton_requires(plugins)
+    |> rewrite_optional_browser_requires()
+  end
+
+  defp rewrite_singleton_requires(code, plugins) do
+    {code, imports} =
+      Enum.reduce(@react_singleton_imports, {code, []}, fn specifier, {code, imports} ->
+        replacement = singleton_require_var(specifier)
+
+        rewritten =
+          code
+          |> String.replace("__require(\"#{specifier}\")", replacement)
+          |> String.replace("__require('#{specifier}')", replacement)
+
+        if rewritten == code do
+          {code, imports}
+        else
+          canonical = Volt.PluginRunner.prebundle_alias(plugins, specifier)
+          {rewritten, [{replacement, vendor_url(canonical)} | imports]}
+        end
+      end)
+
+    imports
+    |> Enum.uniq()
+    |> case do
+      [] -> code
+      imports -> prepend_imports(code, imports)
+    end
+  end
+
+  defp singleton_require_var("react"), do: "__volt_react"
+  defp singleton_require_var("react-dom"), do: "__volt_react_dom"
+  defp singleton_require_var("react-dom/client"), do: "__volt_react_dom_client"
+  defp singleton_require_var("react/jsx-runtime"), do: "__volt_react_jsx_runtime"
+  defp singleton_require_var("react/jsx-dev-runtime"), do: "__volt_react_jsx_dev_runtime"
+
+  defp prepend_imports(code, imports) do
+    prefix =
+      Enum.map_join(imports, "\n", fn {name, specifier} ->
+        "import * as #{name} from #{:json.encode(specifier)};"
+      end)
+
+    prefix <> "\n" <> code
+  end
+
+  defp rewrite_optional_browser_requires(code) do
+    String.replace(code, "__require(emotionPkg).default", "undefined")
+  end
 
   defp resolve_package_entry(specifier, module_dirs) do
     Enum.find_value(module_dirs, :error, fn module_dir ->
